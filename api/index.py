@@ -1,9 +1,11 @@
 """HTTPS-вебхук приватного навыка Алисы для Vercel.
 
-Зависимостей, кроме стандартной библиотеки Python, нет. Все персональные
-настройки передаются через переменные окружения Vercel.
+Версия для OpenRouter. Использует только стандартную библиотеку Python.
+Контекст хранится компактно в session_state Алисы: OpenRouter Responses API
+не использует серверное хранение предыдущих ответов как OpenAI Responses API.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -12,12 +14,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlsplit
 
 
-API_URL = "https://api.openai.com/v1/responses"
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
+API_URL = "https://openrouter.ai/api/v1/responses"
+MODEL = os.environ.get("OPENAI_MODEL", "nvidia/nemotron-3.5-super-vl:free")
 MAX_ANSWER_CHARS = 900  # Лимит поля response.text у Алисы: 1024.
-OPENAI_TIME_BUDGET_SECONDS = 3.6  # У Яндекс Диалогов всего 4,5 с, включая сеть.
+TIME_BUDGET_SECONDS = 3.6  # У Яндекс Диалогов всего 4,5 с, включая сеть.
 
 INSTRUCTIONS = (
     "Ты голосовой помощник в приватном навыке Алисы. Отвечай на русском языке "
@@ -33,21 +37,24 @@ SEARCH_PROMPT = (
     "Не произноси адреса сайтов. Если подтверждения нет, скажи об этом."
 )
 SEARCH_FOLLOWUP = ("что нашлось", "что нашёл", "ну что нашёл", "ну что нашлось")
+HISTORY_TURNS = 3
 
 
-class OpenAIError(Exception):
-    """Ошибка обращения к OpenAI API."""
+class OpenRouterError(Exception):
+    """Ошибка обращения к OpenRouter API."""
 
 
-def _api_request(method, url, key, payload=None, timeout=2.5):
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
+def _api_request(key, payload, timeout=3.2):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        url,
+        API_URL,
         data=body,
-        method=method,
+        method="POST",
         headers={
             "Authorization": "Bearer " + key,
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://vercel.com/",
+            "X-Title": "Alice private skill",
         },
     )
     try:
@@ -58,23 +65,21 @@ def _api_request(method, url, key, payload=None, timeout=2.5):
             detail = json.loads(exc.read().decode("utf-8"))
             error = detail.get("error", {})
             logging.warning(
-                "OpenAI API HTTP %s: %s — %s",
+                "OpenRouter API HTTP %s: %s — %s",
                 exc.code,
                 str(error.get("code") or error.get("type") or "unknown")[:80],
                 str(error.get("message") or "")[:300],
             )
         except (OSError, ValueError, AttributeError):
-            logging.warning("OpenAI API HTTP %s", exc.code)
+            logging.warning("OpenRouter API HTTP %s", exc.code)
         if exc.code == 401:
-            raise OpenAIError("Ключ OpenAI API не принят.") from exc
+            raise OpenRouterError("Ключ OpenRouter API не принят.") from exc
         if exc.code == 429:
-            raise OpenAIError("Сейчас достигнут лимит OpenAI API.") from exc
-        if exc.code == 404:
-            raise OpenAIError("Предыдущий ответ больше недоступен.") from exc
-        raise OpenAIError("Сервис ответов временно недоступен.") from exc
+            raise OpenRouterError("Сейчас достигнут лимит OpenRouter. Попробуйте позже.") from exc
+        raise OpenRouterError("Сервис ответов временно недоступен.") from exc
     except (OSError, ValueError) as exc:
-        logging.warning("OpenAI API request failed: %s", type(exc).__name__)
-        raise OpenAIError("Не удалось связаться с сервисом ответов.") from exc
+        logging.warning("OpenRouter API request failed: %s", type(exc).__name__)
+        raise OpenRouterError("Не удалось связаться с сервисом ответов.") from exc
 
 
 def _needs_web_search(command):
@@ -141,9 +146,24 @@ def _say(text, state=None, end_session=False):
     return result
 
 
-def _finish(data):
+def _clean_history(value):
+    if not isinstance(value, list):
+        return []
+    history = []
+    for turn in value[-HISTORY_TURNS:]:
+        if not isinstance(turn, dict):
+            continue
+        user = turn.get("user")
+        assistant = turn.get("assistant")
+        if isinstance(user, str) and isinstance(assistant, str):
+            history.append({"user": user[:350], "assistant": assistant[:500]})
+    return history
+
+
+def _finish(data, history, question):
     answer = _answer_text(data)
-    result = _say(answer, {"previous_response_id": data["id"]})
+    updated = (history + [{"user": question[:350], "assistant": answer[:500]}])[-HISTORY_TURNS:]
+    result = _say(answer, {"history": updated})
     buttons = _source_buttons(data)
     if buttons:
         result["response"]["buttons"] = buttons
@@ -163,106 +183,53 @@ def handler_alice(event, context):
     state = (event.get("state") or {}).get("session") or {}
     if not isinstance(state, dict):
         state = {}
-    previous_id = state.get("previous_response_id", "")
-    if not isinstance(previous_id, str) or not previous_id.startswith("resp_"):
-        previous_id = ""
+    history = _clean_history(state.get("history"))
 
     if command in ("хватит", "выход", "закончить", "стоп"):
         return _say("До встречи!", end_session=True)
     if command in ("сброс", "забудь разговор", "начать заново"):
-        return _say("Начинаем новый разговор. Что хотите спросить?", {})
+        return _say("Начинаем новый разговор. Что хотите спросить?", {"history": []})
     if re.search(r"\b(поставь|установи|заведи|включи|создай)\b.*\b(будильник|таймер|напоминание)\b", command):
         return _say(
             "Системный будильник, таймер или напоминание я из навыка не устанавливаю. "
             "Скажите «выход», затем обратитесь с просьбой к Алисе.",
-            state,
+            {"history": history},
         )
-
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not key:
-        return _say("В навыке ещё не настроен ключ OpenAI API.")
-
-    pending = state.get("pending_response_id", "")
-    if pending:
-        is_search = bool(state.get("pending_search"))
-        waiting_text = (
-            "Ещё ищу. Спросите «что нашлось?» через несколько секунд."
-            if is_search else "Ещё думаю. Скажите «готово» через несколько секунд."
-        )
-        response_id = pending
-        if not isinstance(response_id, str) or not response_id.startswith("resp_"):
-            return _say("Не удалось продолжить ответ. Повторите вопрос.", {})
-        url = API_URL + "/" + urllib.parse.quote(response_id, safe="")
-        try:
-            data = _api_request("GET", url, key, timeout=2.4)
-        except OpenAIError as exc:
-            if "больше недоступен" in str(exc):
-                return _say(str(exc) + " Повторите вопрос.", {})
-            return _say(str(exc) + " " + waiting_text, state)
-        if data.get("status") == "completed":
-            answer = _finish(data)
-            if command not in ("", "готово", "ответ", "дальше", "ну что", *SEARCH_FOLLOWUP):
-                answer["response"]["text"] += " Повторите ваш новый вопрос."
-            return answer
-        if data.get("status") in ("queued", "in_progress"):
-            return _say(waiting_text, state)
-        return _say("Получить ответ не удалось. Повторите вопрос.", {})
-
     if not utterance or command in ("готово", "ответ", "дальше", *SEARCH_FOLLOWUP):
-        return _say("Здравствуйте! Задайте вопрос, и я постараюсь ответить.", state)
+        return _say("Здравствуйте! Задайте вопрос, и я постараюсь ответить.", {"history": history})
+
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        return _say("В навыке ещё не настроен ключ OpenRouter API.", {"history": history})
 
     question = utterance[:1000]
     search = _needs_web_search(command)
+    input_items = []
+    for turn in history:
+        input_items.append({"role": "user", "content": turn["user"]})
+        input_items.append({"role": "assistant", "content": turn["assistant"]})
+    input_items.append({"role": "user", "content": question})
     payload = {
         "model": MODEL,
         "instructions": INSTRUCTIONS + (" " + SEARCH_PROMPT if search else ""),
-        "input": [{"role": "user", "content": question}],
+        "input": input_items,
         "reasoning": {"effort": "none"},
         "max_output_tokens": 220 if search else 120,
-        "background": search,
-        "store": True,
+        "store": False,
     }
     if search:
-        payload["tools"] = [{"type": "web_search", "search_context_size": "low"}]
+        payload["tools"] = [{"type": "openrouter:web_search", "parameters": {"max_results": 3}}]
         payload["tool_choice"] = "required"
-    if previous_id:
-        payload["previous_response_id"] = previous_id
+
+    remaining = TIME_BUDGET_SECONDS - (time.monotonic() - start)
     try:
-        data = _api_request("POST", API_URL, key, payload=payload, timeout=2.4 if search else 3.6)
-        if data.get("status") == "completed":
-            return _finish(data)
-        response_id = data.get("id", "")
-        if data.get("status") not in ("queued", "in_progress") or not response_id:
-            return _say("Получить ответ не удалось. Повторите вопрос.", state)
+        data = _api_request(key, payload, timeout=max(0.5, min(remaining - 0.2, 3.3)))
+        if data.get("status") not in (None, "completed"):
+            return _say("Ответ не успел подготовиться. Повторите вопрос чуть позже.", {"history": history})
+        return _finish(data, history, question)
+    except OpenRouterError as exc:
+        return _say(str(exc) + " Повторите вопрос позже.", {"history": history})
 
-        # Пока есть время, проверяем готовность без выхода за лимит Алисы.
-        url = API_URL + "/" + urllib.parse.quote(response_id, safe="")
-        while (remaining := OPENAI_TIME_BUDGET_SECONDS - (time.monotonic() - start)) > 0.65:
-            try:
-                ready = _api_request("GET", url, key, timeout=min(remaining - 0.25, 0.8))
-                if ready.get("status") == "completed":
-                    return _finish(ready)
-                if ready.get("status") not in ("queued", "in_progress"):
-                    break
-            except OpenAIError:
-                break
-            if (remaining := OPENAI_TIME_BUDGET_SECONDS - (time.monotonic() - start)) > 0.9:
-                time.sleep(min(0.2, remaining - 0.7))
-        return _say(
-            "Ищу информацию. Спросите «что нашлось?» через несколько секунд."
-            if search else "Думаю над ответом. Скажите «готово» через несколько секунд.",
-            {"pending_response_id": response_id, "pending_search": search},
-        )
-    except OpenAIError as exc:
-        if "больше недоступен" in str(exc):
-            return _say("Контекст беседы устарел. Скажите «сброс» и повторите вопрос.", state)
-        return _say(str(exc) + " Повторите вопрос позже.", state)
-
-
-# HTTPS-вебхук Яндекс Диалогов для Vercel.
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlsplit
-import hmac
 
 SKILL_ID = os.environ.get("ALICE_SKILL_ID", "").strip()
 
@@ -300,4 +267,3 @@ class handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass  # Не записывать секрет вебхука из URL в журнал приложения.
-
